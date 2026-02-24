@@ -1,0 +1,23 @@
+# Global variables for the project
+keep_fps = True
+keep_audio = True
+keep_frames = False
+many_faces = False
+map_faces = False
+poisson_blend = False
+color_correction = False
+nsfw_filter = False
+live_mirror = False
+live_resizable = False
+fp_ui = {"face_enhancer": False}
+show_fps = False
+mouth_mask = False
+show_mouth_mask_box = False
+file_types = (["*.jpg", "*.png"], ["*.mp4", "*.avi"])
+target_path = None
+source_path = None
+output_path = None
+opacity = 1.0
+sharpness = 0.0
+face_swapper_enabled = True
+source_target_map = []
