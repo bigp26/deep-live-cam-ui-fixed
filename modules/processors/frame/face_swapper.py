@@ -46,11 +46,16 @@ models_dir = os.path.join(
 def pre_check() -> bool:
     download_directory_path = abs_dir
     conditional_download(
-        download_directory_path,
+        models_dir,
         [
-            "https://huggingface.co/hacksider/deep-live-cam/blob/main/inswapper_128_fp16.onnx"
+            "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx"
         ],
     )
+    # Ensure the model is named correctly for the swapper
+    downloaded_path = os.path.join(models_dir, "inswapper_128.onnx")
+    target_model_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
+    if os.path.exists(downloaded_path) and not os.path.exists(target_model_path):
+        os.rename(downloaded_path, target_model_path)
     return True
 
 
