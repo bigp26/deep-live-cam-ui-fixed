@@ -1,0 +1,7 @@
+        if modules.globals.source_path is None:
+            update_status('Error: No source image selected.')
+            return
+
+        if modules.globals.target_path is None:
+            update_status('Error: No target image or video selected.')
+            return
