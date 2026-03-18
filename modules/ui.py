@@ -883,21 +883,25 @@ def webcam_preview(root: ctk.CTk, camera_index: int):
 
 
 def get_available_cameras():
-    """Return camera indices and labels.
+    """Return only cameras that are actually readable.
 
-    Linux:
-        Prefer the real /dev/videoN path over camera.index because
-        cv2_enumerate_cameras may expose backend-specific IDs like 1800/1801.
-
-    Windows:
-        Use enumerate_cameras / DirectShow style indices.
-
-    Fallback:
-        Probe a small integer range directly with OpenCV.
+    On Linux, many /dev/videoN nodes exist but are not real capture streams.
+    We therefore probe open + read success before listing them.
     """
     camera_indices = []
     camera_names = []
     seen = set()
+
+    def probe_camera(index: int) -> bool:
+        backend = cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(index, backend)
+        try:
+            if not cap.isOpened():
+                return False
+            ret, frame = cap.read()
+            return bool(ret and frame is not None and getattr(frame, "size", 0) > 0)
+        finally:
+            cap.release()
 
     try:
         for camera in enumerate_cameras():
@@ -906,16 +910,18 @@ def get_available_cameras():
             cam_name = getattr(camera, "name", None)
             cam_index = getattr(camera, "index", None)
 
-            if platform.system() == "Linux" and isinstance(cam_path, str):
-                if cam_path.startswith("/dev/video"):
-                    suffix = cam_path.replace("/dev/video", "", 1)
-                    if suffix.isdigit():
-                        real_index = int(suffix)
+            if platform.system() == "Linux" and isinstance(cam_path, str) and cam_path.startswith("/dev/video"):
+                suffix = cam_path.replace("/dev/video", "", 1)
+                if suffix.isdigit():
+                    real_index = int(suffix)
 
             if real_index is None and isinstance(cam_index, int) and cam_index >= 0:
                 real_index = int(cam_index)
 
             if real_index is None or real_index in seen:
+                continue
+
+            if not probe_camera(real_index):
                 continue
 
             seen.add(real_index)
@@ -927,26 +933,22 @@ def get_available_cameras():
     except Exception as e:
         print(f"Error enumerating cameras: {e}")
 
-    # Windows-specific fallback
     if not camera_names and platform.system() == "Windows":
         try:
             graph = FilterGraph()
             devices = graph.get_input_devices()
             for i, name in enumerate(devices):
-                camera_indices.append(i)
-                camera_names.append(name)
+                if probe_camera(i):
+                    camera_indices.append(i)
+                    camera_names.append(name)
         except Exception:
             pass
 
-    # Generic OpenCV probe fallback
     if not camera_names:
         for i in range(11):
-            cap = cv2.VideoCapture(i, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
-            ok = cap.isOpened()
-            if ok:
+            if probe_camera(i):
                 camera_indices.append(i)
                 camera_names.append(f"Camera {i}")
-            cap.release()
 
     if not camera_names:
         return [], ["No cameras found"]
