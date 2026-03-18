@@ -48,7 +48,7 @@ def parse_args() -> None:
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
-    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
+    program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=choose_default_execution_providers(), choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
 
@@ -78,6 +78,10 @@ def parse_args() -> None:
     modules.globals.live_resizable = args.live_resizable
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
+    if not modules.globals.execution_providers:
+        modules.globals.execution_providers = decode_execution_providers(choose_default_execution_providers())
+    if not modules.globals.execution_providers:
+        modules.globals.execution_providers = ['CPUExecutionProvider']
     modules.globals.execution_threads = args.execution_threads
     modules.globals.lang = args.lang
 
@@ -116,6 +120,12 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
     return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
             if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+
+
+def choose_default_execution_providers() -> List[str]:
+    available = suggest_execution_providers()
+    preferred = [provider for provider in ['cuda', 'cpu'] if provider in available]
+    return preferred or ['cpu']
 
 
 def suggest_max_memory() -> int:
