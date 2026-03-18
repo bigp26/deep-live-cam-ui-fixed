@@ -883,38 +883,70 @@ def webcam_preview(root: ctk.CTk, camera_index: int):
 
 
 def get_available_cameras():
-    """Returns a list of available camera names and indices using cv2_enumerate_cameras."""
+    """Return camera indices and labels.
+
+    Linux:
+        Prefer the real /dev/videoN path over camera.index because
+        cv2_enumerate_cameras may expose backend-specific IDs like 1800/1801.
+
+    Windows:
+        Use enumerate_cameras / DirectShow style indices.
+
+    Fallback:
+        Probe a small integer range directly with OpenCV.
+    """
     camera_indices = []
     camera_names = []
+    seen = set()
 
     try:
         for camera in enumerate_cameras():
-            camera_indices.append(camera.index)
-            # Use name if available, otherwise use index
-            name = camera.name if hasattr(camera, 'name') and camera.name else f"Camera {camera.index}"
-            camera_names.append(name)
+            real_index = None
+            cam_path = getattr(camera, "path", None)
+            cam_name = getattr(camera, "name", None)
+            cam_index = getattr(camera, "index", None)
+
+            if platform.system() == "Linux" and isinstance(cam_path, str):
+                if cam_path.startswith("/dev/video"):
+                    suffix = cam_path.replace("/dev/video", "", 1)
+                    if suffix.isdigit():
+                        real_index = int(suffix)
+
+            if real_index is None and isinstance(cam_index, int) and cam_index >= 0:
+                real_index = int(cam_index)
+
+            if real_index is None or real_index in seen:
+                continue
+
+            seen.add(real_index)
+            label = cam_name if cam_name else f"Camera {real_index}"
+            if isinstance(cam_path, str) and cam_path:
+                label = f"{label} [{cam_path}]"
+            camera_indices.append(real_index)
+            camera_names.append(label)
     except Exception as e:
         print(f"Error enumerating cameras: {e}")
 
-    # Fallback to legacy detection if no cameras found
+    # Windows-specific fallback
+    if not camera_names and platform.system() == "Windows":
+        try:
+            graph = FilterGraph()
+            devices = graph.get_input_devices()
+            for i, name in enumerate(devices):
+                camera_indices.append(i)
+                camera_names.append(name)
+        except Exception:
+            pass
+
+    # Generic OpenCV probe fallback
     if not camera_names:
-        if platform.system() == "Windows":
-            try:
-                graph = FilterGraph()
-                devices = graph.get_input_devices()
-                camera_indices = list(range(len(devices)))
-                camera_names = devices
-            except Exception:
-                pass
-        
-        if not camera_names:
-            # Simple probe fallback
-            for i in range(5):
-                cap = cv2.VideoCapture(i)
-                if cap.isOpened():
-                    camera_indices.append(i)
-                    camera_names.append(f"Camera {i}")
-                    cap.release()
+        for i in range(11):
+            cap = cv2.VideoCapture(i, cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY)
+            ok = cap.isOpened()
+            if ok:
+                camera_indices.append(i)
+                camera_names.append(f"Camera {i}")
+            cap.release()
 
     if not camera_names:
         return [], ["No cameras found"]
