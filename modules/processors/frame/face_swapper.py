@@ -19,6 +19,7 @@ from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weigh
 import os
 from collections import deque
 import time
+import copy
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -118,113 +119,193 @@ def get_face_swapper() -> Any:
     return FACE_SWAPPER
 
 
+def _safe_int_bbox(bbox: np.ndarray | list | tuple, frame_shape) -> Optional[tuple[int, int, int, int]]:
+    if bbox is None or len(bbox) != 4:
+        return None
+    h, w = frame_shape[:2]
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+    except Exception:
+        return None
+
+    x1 = max(0, min(w, x1))
+    y1 = max(0, min(h, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _expanded_roi_from_face(target_face: Face, frame_shape, padding_ratio: float = 0.35) -> Optional[tuple[int, int, int, int]]:
+    bbox = getattr(target_face, "bbox", None)
+    clipped = _safe_int_bbox(bbox, frame_shape)
+    if clipped is None:
+        return None
+
+    x1, y1, x2, y2 = clipped
+    h, w = frame_shape[:2]
+
+    bw = x2 - x1
+    bh = y2 - y1
+    pad_x = int(bw * padding_ratio)
+    pad_y = int(bh * padding_ratio)
+
+    rx1 = max(0, x1 - pad_x)
+    ry1 = max(0, y1 - pad_y)
+    rx2 = min(w, x2 + pad_x)
+    ry2 = min(h, y2 + pad_y)
+
+    if rx2 <= rx1 or ry2 <= ry1:
+        return None
+    return rx1, ry1, rx2, ry2
+
+
+def _shift_points_to_roi(points: Any, offset_x: int, offset_y: int):
+    if points is None:
+        return None
+    try:
+        arr = np.array(points, copy=True)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            arr[:, 0] -= offset_x
+            arr[:, 1] -= offset_y
+        return arr
+    except Exception:
+        return points
+
+
+def _target_face_for_roi(target_face: Face, roi_bounds: tuple[int, int, int, int]) -> Face:
+    rx1, ry1, rx2, ry2 = roi_bounds
+    roi_face = copy.deepcopy(target_face)
+
+    if hasattr(roi_face, "bbox") and roi_face.bbox is not None:
+        roi_face.bbox = np.array(roi_face.bbox, copy=True)
+        roi_face.bbox[0] -= rx1
+        roi_face.bbox[1] -= ry1
+        roi_face.bbox[2] -= rx1
+        roi_face.bbox[3] -= ry1
+
+    if hasattr(roi_face, "kps") and roi_face.kps is not None:
+        roi_face.kps = _shift_points_to_roi(roi_face.kps, rx1, ry1)
+
+    if hasattr(roi_face, "landmark_2d_106") and roi_face.landmark_2d_106 is not None:
+        roi_face.landmark_2d_106 = _shift_points_to_roi(roi_face.landmark_2d_106, rx1, ry1)
+
+    return roi_face
+
+
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """Optimized face swapping with better memory management and performance."""
+    """Optimized face swapping with ROI-first execution when bbox data is available."""
     face_swapper = get_face_swapper()
     if face_swapper is None:
         update_status("Face swapper model not loaded or failed to load. Skipping swap.", NAME)
         return temp_frame
 
-    # Safety check for faces
     if source_face is None or target_face is None:
         return temp_frame
-    if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
+    if not hasattr(source_face, "normed_embedding") or source_face.normed_embedding is None:
         return temp_frame
 
-    # Store a copy of the original frame before swapping for opacity blending
     original_frame = temp_frame.copy()
 
-    # Pre-swap Input Check with optimization
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
+    if not temp_frame.flags["C_CONTIGUOUS"]:
+        temp_frame = np.ascontiguousarray(temp_frame)
 
-    # Apply the face swap with optimized memory handling
+    roi_bounds = _expanded_roi_from_face(target_face, temp_frame.shape)
+    swapped_frame = None
+    used_roi = False
+
     try:
-        # Ensure contiguous memory layout for better performance on all platforms
-        if not temp_frame.flags['C_CONTIGUOUS']:
-            temp_frame = np.ascontiguousarray(temp_frame)
-        
-        swapped_frame_raw = face_swapper.get(
-            temp_frame, target_face, source_face, paste_back=True
-        )
+        if roi_bounds is not None:
+            rx1, ry1, rx2, ry2 = roi_bounds
+            roi_frame = temp_frame[ry1:ry2, rx1:rx2].copy()
+            roi_target_face = _target_face_for_roi(target_face, roi_bounds)
 
-        # --- START: CRITICAL FIX FOR ORT 1.17 ---
-        # Check the output type and range from the model
-        if swapped_frame_raw is None:
-             # print("Warning: face_swapper.get returned None.") # Debug
-             return original_frame # Return original if swap somehow failed internally
+            swapped_roi_raw = face_swapper.get(
+                roi_frame,
+                roi_target_face,
+                source_face,
+                paste_back=True,
+            )
 
-        # Ensure the output is a numpy array
-        if not isinstance(swapped_frame_raw, np.ndarray):
-            # print(f"Warning: face_swapper.get returned type {type(swapped_frame_raw)}, expected numpy array.") # Debug
-            return original_frame
+            if isinstance(swapped_roi_raw, np.ndarray):
+                if swapped_roi_raw.shape != roi_frame.shape:
+                    swapped_roi_raw = gpu_resize(
+                        swapped_roi_raw,
+                        (roi_frame.shape[1], roi_frame.shape[0]),
+                    )
+                swapped_roi = np.clip(swapped_roi_raw, 0, 255).astype(np.uint8)
 
-        # Ensure the output has the correct shape (like the input frame)
-        if swapped_frame_raw.shape != temp_frame.shape:
-             # print(f"Warning: Swapped frame shape {swapped_frame_raw.shape} differs from input {temp_frame.shape}.") # Debug
-             # Attempt resize (might distort if aspect ratio changed, but better than crashing)
-             try:
-                 swapped_frame_raw = gpu_resize(swapped_frame_raw, (temp_frame.shape[1], temp_frame.shape[0]))
-             except Exception as resize_e:
-                 # print(f"Error resizing swapped frame: {resize_e}") # Debug
-                 return original_frame
+                swapped_frame = original_frame.copy()
+                swapped_frame[ry1:ry2, rx1:rx2] = swapped_roi
+                used_roi = True
 
-        # Explicitly clip values to 0-255 and convert to uint8
-        # This handles cases where the model might output floats or values outside the valid range
-        swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
-        # --- END: CRITICAL FIX FOR ORT 1.17 ---
+        if swapped_frame is None:
+            swapped_frame_raw = face_swapper.get(
+                temp_frame,
+                target_face,
+                source_face,
+                paste_back=True,
+            )
+
+            if swapped_frame_raw is None:
+                return original_frame
+            if not isinstance(swapped_frame_raw, np.ndarray):
+                return original_frame
+            if swapped_frame_raw.shape != temp_frame.shape:
+                swapped_frame_raw = gpu_resize(
+                    swapped_frame_raw,
+                    (temp_frame.shape[1], temp_frame.shape[0]),
+                )
+            swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
 
     except Exception as e:
-        print(f"Error during face swap using face_swapper.get: {e}") # More specific error
-        # import traceback
-        # traceback.print_exc() # Print full traceback for debugging
-        return original_frame # Return original if swap fails
+        print(f"Error during face swap using face_swapper.get: {e}")
+        return original_frame
 
-    # --- Post-swap Processing (Masking, Opacity, etc.) ---
-    # Now, work with the guaranteed uint8 'swapped_frame'
-
-    if getattr(modules.globals, "mouth_mask", False): # Check if mouth_mask is enabled
-        # Create a mask for the target face
-        face_mask = create_face_mask(target_face, temp_frame) # Use temp_frame (original shape) for mask creation geometry
-
-        # Create the mouth mask using original geometry
+    if getattr(modules.globals, "mouth_mask", False):
+        face_mask = create_face_mask(target_face, temp_frame)
         mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
-            create_lower_mouth_mask(target_face, temp_frame) # Use temp_frame (original) for cutout
+            create_lower_mouth_mask(target_face, temp_frame)
         )
 
-        # Apply the mouth area only if mouth_cutout exists
-        if mouth_cutout is not None and mouth_box != (0,0,0,0): # Add check for valid box
-             # Apply mouth area (from original) onto the 'swapped_frame'
+        if mouth_cutout is not None and mouth_box != (0, 0, 0, 0):
             swapped_frame = apply_mouth_area(
-                swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon
+                swapped_frame,
+                mouth_cutout,
+                mouth_box,
+                face_mask,
+                lower_lip_polygon,
             )
 
             if getattr(modules.globals, "show_mouth_mask_box", False):
-                        mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
-                        # Draw visualization on the swapped_frame *before* opacity blending
-                        swapped_frame = draw_mouth_mask_visualization(
-                            swapped_frame, target_face, mouth_mask_data
-                        )
-        
-    # --- Poisson Blending ---
+                mouth_mask_data = (
+                    mouth_mask,
+                    mouth_cutout,
+                    mouth_box,
+                    lower_lip_polygon,
+                )
+                swapped_frame = draw_mouth_mask_visualization(
+                    swapped_frame,
+                    target_face,
+                    mouth_mask_data,
+                )
+
     if getattr(modules.globals, "poisson_blend", False):
         face_mask = create_face_mask(target_face, temp_frame)
         if face_mask is not None:
-            # Find bounding box of the mask
             y_indices, x_indices = np.where(face_mask > 0)
             if len(x_indices) > 0 and len(y_indices) > 0:
                 x_min, x_max = np.min(x_indices), np.max(x_indices)
                 y_min, y_max = np.min(y_indices), np.max(y_indices)
-
-                # Calculate center
                 center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
-
-                # Crop src and mask
                 src_crop = swapped_frame[y_min : y_max + 1, x_min : x_max + 1]
                 mask_crop = face_mask[y_min : y_max + 1, x_min : x_max + 1]
 
                 try:
-                    # Use original_frame as destination to blend the swapped face onto it
                     swapped_frame = cv2.seamlessClone(
                         src_crop,
                         original_frame,
@@ -234,18 +315,29 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                     )
                 except Exception as e:
                     print(f"Poisson blending failed: {e}")
-        
-            # Apply opacity blend between the original frame and the swapped frame
+
     opacity = getattr(modules.globals, "opacity", 1.0)
-    # Ensure opacity is within valid range [0.0, 1.0]
     opacity = max(0.0, min(1.0, opacity))
 
-    # Blend the original_frame with the (potentially mouth-masked) swapped_frame
-    # Ensure both frames are uint8 before blending
-    final_swapped_frame = gpu_add_weighted(original_frame.astype(np.uint8), 1 - opacity, swapped_frame.astype(np.uint8), opacity, 0)
-
-    # Ensure final frame is uint8 after blending (addWeighted should preserve it, but belt-and-suspenders)
-    final_swapped_frame = final_swapped_frame.astype(np.uint8)
+    if used_roi and roi_bounds is not None:
+        rx1, ry1, rx2, ry2 = roi_bounds
+        final_swapped_frame = original_frame.copy()
+        blended_roi = gpu_add_weighted(
+            original_frame[ry1:ry2, rx1:rx2].astype(np.uint8),
+            1 - opacity,
+            swapped_frame[ry1:ry2, rx1:rx2].astype(np.uint8),
+            opacity,
+            0,
+        )
+        final_swapped_frame[ry1:ry2, rx1:rx2] = blended_roi.astype(np.uint8)
+    else:
+        final_swapped_frame = gpu_add_weighted(
+            original_frame.astype(np.uint8),
+            1 - opacity,
+            swapped_frame.astype(np.uint8),
+            opacity,
+            0,
+        ).astype(np.uint8)
 
     return final_swapped_frame
 
