@@ -25,3 +25,20 @@ models/DMDNet.pth
 faceswap/
 .vscode/
 switch_states.json
+
+# local vendor / nested repos
+GFPGAN/
+Deep-Live-Cam/
+
+# local virtualenvs
+venv/
+.audit-venv/
+
+# local audits / snapshots
+audit/
+audit_bundle.tgz
+snapshots/
+
+# local model binaries
+models/*.onnx
+switch_states.json
