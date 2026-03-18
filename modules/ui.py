@@ -944,28 +944,80 @@ def _capture_thread_func(cap, capture_queue, stop_event):
                 pass
 
 
-# How often to run full face detection. On intermediate frames the last
-# detected face positions are reused, which significantly reduces the
-# per-frame cost of the processing thread.
-DETECT_EVERY_N = 2
+# Blind detect-every-N is too expensive and too unstable.
+# Use conditional re-detection based on cache validity, elapsed frames,
+# and simple scene-change scoring.
+REDETECT_INTERVAL = 12
+SCENE_CHANGE_THRESHOLD = 12.0
+SCENE_SAMPLE_SIZE = (160, 90)
+
+
+def _frame_delta_score(previous_frame, current_frame) -> float:
+    if previous_frame is None or current_frame is None:
+        return 999.0
+
+    prev_small = cv2.resize(previous_frame, SCENE_SAMPLE_SIZE)
+    curr_small = cv2.resize(current_frame, SCENE_SAMPLE_SIZE)
+
+    prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr_small, cv2.COLOR_BGR2GRAY)
+
+    return float(np.mean(cv2.absdiff(prev_gray, curr_gray)))
+
+
+def _should_run_detection(
+    proc_frame_index: int,
+    last_detect_index: int,
+    previous_input_frame,
+    current_input_frame,
+    cached_target_face,
+    cached_many_faces,
+) -> bool:
+    if modules.globals.many_faces:
+        if not cached_many_faces:
+            return True
+    else:
+        if cached_target_face is None:
+            return True
+
+    if last_detect_index < 0:
+        return True
+
+    if proc_frame_index - last_detect_index >= REDETECT_INTERVAL:
+        return True
+
+    if _frame_delta_score(previous_input_frame, current_input_frame) >= SCENE_CHANGE_THRESHOLD:
+        return True
+
+    return False
 
 
 def _processing_thread_func(capture_queue, processed_queue, stop_event):
-    """Processing thread: takes raw frames from capture_queue, applies face
-    processing, and puts results into processed_queue. Drops processed frames
-    when the output queue is full so the UI always gets the latest result.
+    """Processing thread: consumes camera frames, applies live processors,
+    and pushes only the newest processed frame to the UI queue.
 
-    Uses DETECT_EVERY_N to skip expensive face detection on intermediate
-    frames, reusing cached face positions instead."""
+    Detection is no longer executed on a blind fixed cadence alone. Instead,
+    cached face results are reused until one of these conditions forces a
+    refresh:
+      - no cached faces exist
+      - enough frames have elapsed since the last detection
+      - the scene changed materially
+    """
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
     source_image = None
+    source_path_cache = None
+
     prev_time = time.time()
     fps_update_interval = 0.5
     frame_count = 0
     fps = 0
+
     proc_frame_index = 0
-    cached_target_face = None  # cached single-face result
-    cached_many_faces = None   # cached many-faces result
+    last_detect_index = -1
+    previous_input_frame = None
+
+    cached_target_face = None
+    cached_many_faces = None
 
     while not stop_event.is_set():
         try:
@@ -974,45 +1026,66 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
             continue
 
         temp_frame = frame.copy()
-        run_detection = (proc_frame_index % DETECT_EVERY_N == 0)
-        proc_frame_index += 1
 
         if modules.globals.live_mirror:
             temp_frame = gpu_flip(temp_frame, 1)
 
+        analysis_frame = temp_frame.copy()
+
         if not modules.globals.map_faces:
+            if modules.globals.source_path != source_path_cache:
+                source_path_cache = modules.globals.source_path
+                source_image = None
+
             if source_image is None and modules.globals.source_path:
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
-            # Update face detection cache on detection frames
-            if run_detection or (cached_target_face is None and cached_many_faces is None):
+            run_detection = _should_run_detection(
+                proc_frame_index=proc_frame_index,
+                last_detect_index=last_detect_index,
+                previous_input_frame=previous_input_frame,
+                current_input_frame=analysis_frame,
+                cached_target_face=cached_target_face,
+                cached_many_faces=cached_many_faces,
+            )
+            proc_frame_index += 1
+
+            if run_detection:
                 if modules.globals.many_faces:
-                    cached_many_faces = get_many_faces(temp_frame)
+                    cached_many_faces = get_many_faces(analysis_frame)
                     cached_target_face = None
                 else:
-                    cached_target_face = get_one_face(temp_frame)
+                    cached_target_face = get_one_face(analysis_frame)
                     cached_many_faces = None
+                last_detect_index = proc_frame_index
 
             for frame_processor in frame_processors:
                 if frame_processor.NAME == "DLC.FACE-ENHANCER":
                     if modules.globals.fp_ui["face_enhancer"]:
                         temp_frame = frame_processor.process_frame(None, temp_frame)
                 elif frame_processor.NAME == "DLC.FACE-SWAPPER":
-                    # Use cached face positions to skip redundant detection
                     swapped_bboxes = []
+
                     if modules.globals.many_faces and cached_many_faces:
                         result = temp_frame.copy()
                         for t_face in cached_many_faces:
                             result = frame_processor.swap_face(source_image, t_face, result)
-                            if hasattr(t_face, 'bbox') and t_face.bbox is not None:
+                            if hasattr(t_face, "bbox") and t_face.bbox is not None:
                                 swapped_bboxes.append(t_face.bbox.astype(int))
                         temp_frame = result
                     elif cached_target_face is not None:
-                        temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
-                        if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:
+                        temp_frame = frame_processor.swap_face(
+                            source_image,
+                            cached_target_face,
+                            temp_frame,
+                        )
+                        if hasattr(cached_target_face, "bbox") and cached_target_face.bbox is not None:
                             swapped_bboxes.append(cached_target_face.bbox.astype(int))
-                    # Apply post-processing (sharpening, interpolation)
-                    temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
+
+                    temp_frame = frame_processor.apply_post_processing(
+                        temp_frame,
+                        swapped_bboxes,
+                    )
                 else:
                     temp_frame = frame_processor.process_frame(source_image, temp_frame)
         else:
@@ -1023,6 +1096,40 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                         temp_frame = frame_processor.process_frame_v2(temp_frame)
                 else:
                     temp_frame = frame_processor.process_frame_v2(temp_frame)
+
+        previous_input_frame = analysis_frame
+
+        # Calculate and display FPS
+        current_time = time.time()
+        frame_count += 1
+        if current_time - prev_time >= fps_update_interval:
+            fps = frame_count / (current_time - prev_time)
+            frame_count = 0
+            prev_time = current_time
+
+        if modules.globals.show_fps:
+            cv2.putText(
+                temp_frame,
+                f"FPS: {fps:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
+
+        # Put processed frame into output queue, dropping old frames if full
+        try:
+            processed_queue.put_nowait(temp_frame)
+        except queue.Full:
+            try:
+                processed_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                processed_queue.put_nowait(temp_frame)
+            except queue.Full:
+                pass
 
         # Calculate and display FPS
         current_time = time.time()
