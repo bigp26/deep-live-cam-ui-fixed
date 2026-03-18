@@ -1,36 +1,67 @@
 import os
 import shutil
+from pathlib import Path
 from typing import Any
-import insightface
-import threading
 
 import cv2
+import insightface
 import numpy as np
-import modules.globals
+import onnxruntime
 from tqdm import tqdm
-from modules.typing import Frame
+import threading
+
+import modules.globals
 from modules.cluster_analysis import find_cluster_centroids, find_closest_centroid
-from modules.utilities import get_temp_directory_path, create_temp, extract_frames, clean_temp, get_temp_frame_paths
-from pathlib import Path
+from modules.typing import Frame
+from modules.utilities import (
+    clean_temp,
+    create_temp,
+    extract_frames,
+    get_temp_directory_path,
+    get_temp_frame_paths,
+)
 
 FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
 
 
+def _runtime_execution_providers() -> list[str]:
+    configured = list(modules.globals.execution_providers or [])
+    if configured:
+        return configured
+
+    available = onnxruntime.get_available_providers()
+    resolved = [
+        provider
+        for provider in (
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        )
+        if provider in available
+    ]
+    return resolved or ["CPUExecutionProvider"]
+
+
 def get_face_analyser() -> Any:
-    """Get face analyser with thread-safe initialization."""
     global FACE_ANALYSER
 
     if FACE_ANALYSER is None:
         with FACE_ANALYSER_LOCK:
-            # Double-check after acquiring lock
             if FACE_ANALYSER is None:
+                providers = _runtime_execution_providers()
+                ctx_id = 0 if any(
+                    provider in providers
+                    for provider in ("TensorrtExecutionProvider", "CUDAExecutionProvider")
+                ) else -1
+
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
-                    name='buffalo_l',
-                    providers=modules.globals.execution_providers,
-                    allowed_modules=['detection', 'recognition']
+                    name="buffalo_l",
+                    providers=providers,
+                    allowed_modules=["detection", "recognition"],
                 )
-                FACE_ANALYSER.prepare(ctx_id=0, det_size=(320, 320))
+                det_size = (640, 640)
+                FACE_ANALYSER.prepare(ctx_id=ctx_id, det_size=det_size)
     return FACE_ANALYSER
 
 
@@ -48,41 +79,47 @@ def get_many_faces(frame: Frame) -> Any:
     except IndexError:
         return None
 
+
 def has_valid_map() -> bool:
     for map in modules.globals.source_target_map:
         if "source" in map and "target" in map:
             return True
     return False
 
+
 def default_source_face() -> Any:
     for map in modules.globals.source_target_map:
         if "source" in map:
-            return map['source']['face']
+            return map["source"]["face"]
     return None
+
 
 def simplify_maps() -> Any:
     centroids = []
     faces = []
     for map in modules.globals.source_target_map:
         if "source" in map and "target" in map:
-            centroids.append(map['target']['face'].normed_embedding)
-            faces.append(map['source']['face'])
+            centroids.append(map["target"]["face"].normed_embedding)
+            faces.append(map["source"]["face"])
 
-    modules.globals.simple_map = {'source_faces': faces, 'target_embeddings': centroids}
+    modules.globals.simple_map = {
+        "source_faces": faces,
+        "target_embeddings": centroids,
+    }
     return None
+
 
 def add_blank_map() -> Any:
     try:
         max_id = -1
         if len(modules.globals.source_target_map) > 0:
-            max_id = max(modules.globals.source_target_map, key=lambda x: x['id'])['id']
+            max_id = max(modules.globals.source_target_map, key=lambda x: x["id"])["id"]
 
-        modules.globals.source_target_map.append({
-                'id' : max_id + 1
-                })
+        modules.globals.source_target_map.append({"id": max_id + 1})
     except ValueError:
         return None
-    
+
+
 def get_unique_faces_from_target_image() -> Any:
     try:
         modules.globals.source_target_map = []
@@ -91,29 +128,31 @@ def get_unique_faces_from_target_image() -> Any:
         i = 0
 
         for face in many_faces:
-            x_min, y_min, x_max, y_max = face['bbox']
-            modules.globals.source_target_map.append({
-                'id' : i, 
-                'target' : {
-                            'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
-                            'face' : face
-                            }
-                })
+            x_min, y_min, x_max, y_max = face["bbox"]
+            modules.globals.source_target_map.append(
+                {
+                    "id": i,
+                    "target": {
+                        "cv2": target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
+                        "face": face,
+                    },
+                }
+            )
             i = i + 1
     except ValueError:
         return None
-    
-    
+
+
 def get_unique_faces_from_target_video() -> Any:
     try:
         modules.globals.source_target_map = []
         frame_face_embeddings = []
         face_embeddings = []
-    
-        print('Creating temp resources...')
+
+        print("Creating temp resources...")
         clean_temp(modules.globals.target_path)
         create_temp(modules.globals.target_path)
-        print('Extracting frames...')
+        print("Extracting frames...")
         extract_frames(modules.globals.target_path)
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
@@ -125,75 +164,93 @@ def get_unique_faces_from_target_video() -> Any:
 
             for face in many_faces:
                 face_embeddings.append(face.normed_embedding)
-            
-            frame_face_embeddings.append({'frame': i, 'faces': many_faces, 'location': temp_frame_path})
+
+            frame_face_embeddings.append(
+                {"frame": i, "faces": many_faces, "location": temp_frame_path}
+            )
             i += 1
 
         centroids = find_cluster_centroids(face_embeddings)
 
         for frame in frame_face_embeddings:
-            for face in frame['faces']:
-                closest_centroid_index, _ = find_closest_centroid(centroids, face.normed_embedding)
-                face['target_centroid'] = closest_centroid_index
+            for face in frame["faces"]:
+                closest_centroid_index, _ = find_closest_centroid(
+                    centroids, face.normed_embedding
+                )
+                face["target_centroid"] = closest_centroid_index
 
         for i in range(len(centroids)):
-            modules.globals.source_target_map.append({
-                'id' : i
-            })
+            modules.globals.source_target_map.append({"id": i})
 
             temp = []
-            for frame in tqdm(frame_face_embeddings, desc=f"Mapping frame embeddings to centroids-{i}"):
-                temp.append({'frame': frame['frame'], 'faces': [face for face in frame['faces'] if face['target_centroid'] == i], 'location': frame['location']})
+            for frame in tqdm(
+                frame_face_embeddings, desc=f"Mapping frame embeddings to centroids-{i}"
+            ):
+                temp.append(
+                    {
+                        "frame": frame["frame"],
+                        "faces": [
+                            face
+                            for face in frame["faces"]
+                            if face["target_centroid"] == i
+                        ],
+                        "location": frame["location"],
+                    }
+                )
 
-            modules.globals.source_target_map[i]['target_faces_in_frame'] = temp
+            modules.globals.source_target_map[i]["target_faces_in_frame"] = temp
 
-        # dump_faces(centroids, frame_face_embeddings)
         default_target_face()
     except ValueError:
         return None
-    
+
 
 def default_target_face():
     for map in modules.globals.source_target_map:
         best_face = None
         best_frame = None
-        for frame in map['target_faces_in_frame']:
-            if len(frame['faces']) > 0:
-                best_face = frame['faces'][0]
+        for frame in map["target_faces_in_frame"]:
+            if len(frame["faces"]) > 0:
+                best_face = frame["faces"][0]
                 best_frame = frame
                 break
 
-        for frame in map['target_faces_in_frame']:
-            for face in frame['faces']:
-                if face['det_score'] > best_face['det_score']:
+        for frame in map["target_faces_in_frame"]:
+            for face in frame["faces"]:
+                if face["det_score"] > best_face["det_score"]:
                     best_face = face
                     best_frame = frame
 
-        x_min, y_min, x_max, y_max = best_face['bbox']
+        x_min, y_min, x_max, y_max = best_face["bbox"]
 
-        target_frame = cv2.imread(best_frame['location'])
-        map['target'] = {
-                        'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
-                        'face' : best_face
-                        }
+        target_frame = cv2.imread(best_frame["location"])
+        map["target"] = {
+            "cv2": target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
+            "face": best_face,
+        }
 
 
 def dump_faces(centroids: Any, frame_face_embeddings: list):
     temp_directory_path = get_temp_directory_path(modules.globals.target_path)
 
     for i in range(len(centroids)):
-        if os.path.exists(temp_directory_path + f"/{i}") and os.path.isdir(temp_directory_path + f"/{i}"):
+        if os.path.exists(temp_directory_path + f"/{i}") and os.path.isdir(
+            temp_directory_path + f"/{i}"
+        ):
             shutil.rmtree(temp_directory_path + f"/{i}")
         Path(temp_directory_path + f"/{i}").mkdir(parents=True, exist_ok=True)
 
         for frame in tqdm(frame_face_embeddings, desc=f"Copying faces to temp/./{i}"):
-            temp_frame = cv2.imread(frame['location'])
+            temp_frame = cv2.imread(frame["location"])
 
             j = 0
-            for face in frame['faces']:
-                if face['target_centroid'] == i:
-                    x_min, y_min, x_max, y_max = face['bbox']
+            for face in frame["faces"]:
+                if face["target_centroid"] == i:
+                    x_min, y_min, x_max, y_max = face["bbox"]
 
                     if temp_frame[int(y_min):int(y_max), int(x_min):int(x_max)].size > 0:
-                        cv2.imwrite(temp_directory_path + f"/{i}/{frame['frame']}_{j}.png", temp_frame[int(y_min):int(y_max), int(x_min):int(x_max)])
+                        cv2.imwrite(
+                            temp_directory_path + f"/{i}/{frame['frame']}_{j}.png",
+                            temp_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
+                        )
                 j += 1

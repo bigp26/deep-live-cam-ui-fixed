@@ -19,6 +19,7 @@ from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weigh
 import os
 from collections import deque
 import time
+import onnxruntime
 import copy
 
 FACE_SWAPPER = None
@@ -76,20 +77,56 @@ def pre_start() -> bool:
     return True
 
 
+def _runtime_execution_providers() -> list[str]:
+    configured = list(modules.globals.execution_providers or [])
+    if configured:
+        return configured
+
+    available = onnxruntime.get_available_providers()
+    resolved = [
+        provider
+        for provider in (
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        )
+        if provider in available
+    ]
+    return resolved or ["CPUExecutionProvider"]
+
+
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            model_name = "inswapper_128.onnx"
-            if "CUDAExecutionProvider" in modules.globals.execution_providers:
-                model_name = "inswapper_128_fp16.onnx"
-            model_path = os.path.join(models_dir, model_name)
+            runtime_providers = _runtime_execution_providers()
+
+            # Default to the stable standard model.
+            # The fp16 variant can be enabled explicitly with:
+            #   export DLC_USE_FP16_INSWAPPER=1
+            use_fp16 = os.environ.get("DLC_USE_FP16_INSWAPPER", "").strip() == "1"
+
+            model_candidates = []
+            if use_fp16:
+                model_candidates.append("inswapper_128_fp16.onnx")
+            model_candidates.append("inswapper_128.onnx")
+
+            model_path = None
+            for model_name in model_candidates:
+                candidate = os.path.join(models_dir, model_name)
+                if os.path.exists(candidate):
+                    model_path = candidate
+                    break
+
+            if model_path is None:
+                model_path = os.path.join(models_dir, "inswapper_128.onnx")
+
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
                 # Optimized provider configuration for Apple Silicon
                 providers_config = []
-                for p in modules.globals.execution_providers:
+                for p in runtime_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
                         # Enhanced CoreML configuration for M1-M5
                         providers_config.append((
@@ -214,34 +251,40 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not temp_frame.flags["C_CONTIGUOUS"]:
         temp_frame = np.ascontiguousarray(temp_frame)
 
-    roi_bounds = _expanded_roi_from_face(target_face, temp_frame.shape)
+    use_roi_swap = os.environ.get("DLC_ENABLE_ROI_SWAP", "").strip() == "1"
+    roi_bounds = _expanded_roi_from_face(target_face, temp_frame.shape) if use_roi_swap else None
     swapped_frame = None
     used_roi = False
 
     try:
         if roi_bounds is not None:
-            rx1, ry1, rx2, ry2 = roi_bounds
-            roi_frame = temp_frame[ry1:ry2, rx1:rx2].copy()
-            roi_target_face = _target_face_for_roi(target_face, roi_bounds)
+            try:
+                rx1, ry1, rx2, ry2 = roi_bounds
+                roi_frame = temp_frame[ry1:ry2, rx1:rx2].copy()
+                roi_target_face = _target_face_for_roi(target_face, roi_bounds)
 
-            swapped_roi_raw = face_swapper.get(
-                roi_frame,
-                roi_target_face,
-                source_face,
-                paste_back=True,
-            )
+                swapped_roi_raw = face_swapper.get(
+                    roi_frame,
+                    roi_target_face,
+                    source_face,
+                    paste_back=True,
+                )
 
-            if isinstance(swapped_roi_raw, np.ndarray):
-                if swapped_roi_raw.shape != roi_frame.shape:
-                    swapped_roi_raw = gpu_resize(
-                        swapped_roi_raw,
-                        (roi_frame.shape[1], roi_frame.shape[0]),
-                    )
-                swapped_roi = np.clip(swapped_roi_raw, 0, 255).astype(np.uint8)
+                if isinstance(swapped_roi_raw, np.ndarray):
+                    if swapped_roi_raw.shape != roi_frame.shape:
+                        swapped_roi_raw = gpu_resize(
+                            swapped_roi_raw,
+                            (roi_frame.shape[1], roi_frame.shape[0]),
+                        )
+                    swapped_roi = np.clip(swapped_roi_raw, 0, 255).astype(np.uint8)
 
-                swapped_frame = original_frame.copy()
-                swapped_frame[ry1:ry2, rx1:rx2] = swapped_roi
-                used_roi = True
+                    swapped_frame = original_frame.copy()
+                    swapped_frame[ry1:ry2, rx1:rx2] = swapped_roi
+                    used_roi = True
+            except Exception as roi_e:
+                print(f"{NAME}: ROI swap failed, falling back to full-frame swap: {roi_e}")
+                swapped_frame = None
+                used_roi = False
 
         if swapped_frame is None:
             swapped_frame_raw = face_swapper.get(
@@ -264,6 +307,8 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     except Exception as e:
         print(f"Error during face swap using face_swapper.get: {e}")
+        print(f"{NAME}: source_face type={type(source_face)} target_face type={type(target_face)}")
+        print(f"{NAME}: target_face has bbox={hasattr(target_face, 'bbox')} kps={hasattr(target_face, 'kps')} landmark_2d_106={hasattr(target_face, 'landmark_2d_106')}")
         return original_frame
 
     if getattr(modules.globals, "mouth_mask", False):
