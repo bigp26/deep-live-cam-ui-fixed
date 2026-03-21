@@ -175,7 +175,12 @@ def _safe_int_bbox(bbox: np.ndarray | list | tuple, frame_shape) -> Optional[tup
     return x1, y1, x2, y2
 
 
-def _expanded_roi_from_face(target_face: Face, frame_shape, padding_ratio: float = 0.35) -> Optional[tuple[int, int, int, int]]:
+def _expanded_roi_from_face(
+    target_face: Face,
+    frame_shape,
+    padding_ratio: float = 0.45,
+    min_pad_px: int = 24,
+) -> Optional[tuple[int, int, int, int]]:
     bbox = getattr(target_face, "bbox", None)
     clipped = _safe_int_bbox(bbox, frame_shape)
     if clipped is None:
@@ -186,13 +191,15 @@ def _expanded_roi_from_face(target_face: Face, frame_shape, padding_ratio: float
 
     bw = x2 - x1
     bh = y2 - y1
-    pad_x = int(bw * padding_ratio)
-    pad_y = int(bh * padding_ratio)
+
+    pad_x = max(min_pad_px, int(bw * padding_ratio))
+    pad_y_top = max(min_pad_px, int(bh * (padding_ratio + 0.15)))
+    pad_y_bottom = max(min_pad_px, int(bh * (padding_ratio + 0.05)))
 
     rx1 = max(0, x1 - pad_x)
-    ry1 = max(0, y1 - pad_y)
+    ry1 = max(0, y1 - pad_y_top)
     rx2 = min(w, x2 + pad_x)
-    ry2 = min(h, y2 + pad_y)
+    ry2 = min(h, y2 + pad_y_bottom)
 
     if rx2 <= rx1 or ry2 <= ry1:
         return None
@@ -213,8 +220,13 @@ def _shift_points_to_roi(points: Any, offset_x: int, offset_y: int):
 
 
 def _target_face_for_roi(target_face: Face, roi_bounds: tuple[int, int, int, int]) -> Face:
-    rx1, ry1, rx2, ry2 = roi_bounds
-    roi_face = copy.deepcopy(target_face)
+    rx1, ry1, _, _ = roi_bounds
+
+    # Shallow copy preserves the Face object's internals better than deepcopy.
+    try:
+        roi_face = copy.copy(target_face)
+    except Exception:
+        roi_face = target_face
 
     if hasattr(roi_face, "bbox") and roi_face.bbox is not None:
         roi_face.bbox = np.array(roi_face.bbox, copy=True)
@@ -233,7 +245,7 @@ def _target_face_for_roi(target_face: Face, roi_bounds: tuple[int, int, int, int
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """Optimized face swapping with ROI-first execution when bbox data is available."""
+    """Stable face swap with optional padded ROI path and automatic full-frame fallback."""
     face_swapper = get_face_swapper()
     if face_swapper is None:
         update_status("Face swapper model not loaded or failed to load. Skipping swap.", NAME)
@@ -270,7 +282,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                     paste_back=True,
                 )
 
-                if isinstance(swapped_roi_raw, np.ndarray):
+                if swapped_roi_raw is not None and isinstance(swapped_roi_raw, np.ndarray):
                     if swapped_roi_raw.shape != roi_frame.shape:
                         swapped_roi_raw = gpu_resize(
                             swapped_roi_raw,

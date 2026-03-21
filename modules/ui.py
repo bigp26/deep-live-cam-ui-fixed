@@ -81,6 +81,9 @@ popup_status_label_live = None
 source_label_dict = {}
 source_label_dict_live = {}
 target_label_dict_live = {}
+LIVE_PREVIEW_ACTIVE = False
+
+DEFAULT_SOURCE_DIRECTORY = "/home/bigp/Pictures"
 
 img_ft, vid_ft = modules.globals.file_types
 
@@ -111,6 +114,7 @@ def save_switch_states():
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
+        "face_enhancer_upscale": modules.globals.face_enhancer_upscale,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
     }
     with open("switch_states.json", "w") as f:
@@ -134,6 +138,7 @@ def load_switch_states():
         modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = switch_states.get("show_fps", False)
         modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
+        modules.globals.face_enhancer_upscale = switch_states.get("face_enhancer_upscale", 1)
         modules.globals.show_mouth_mask_box = switch_states.get(
             "show_mouth_mask_box", False
         )
@@ -450,6 +455,33 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     )
     sharpness_slider.place(relx=0.35, rely=0.82, relwidth=0.5, relheight=0.02)
 
+    enhancer_upscale_var = ctk.DoubleVar(value=float(getattr(modules.globals, "face_enhancer_upscale", 1)))
+
+    def on_enhancer_upscale_change(value: float):
+        modules.globals.face_enhancer_upscale = max(1, int(round(float(value))))
+        update_status(f"Enhancer upscale set to {modules.globals.face_enhancer_upscale}")
+        save_switch_states()
+
+    enhancer_upscale_label = ctk.CTkLabel(root, text="Enhancer Upscale:")
+    enhancer_upscale_label.place(relx=0.15, rely=0.835, relwidth=0.2, relheight=0.05)
+
+    enhancer_upscale_slider = ctk.CTkSlider(
+        root,
+        from_=1.0,
+        to=4.0,
+        number_of_steps=3,
+        variable=enhancer_upscale_var,
+        command=on_enhancer_upscale_change,
+        fg_color="#E0E0E0",
+        progress_color="#007BFF",
+        button_color="#FFFFFF",
+        button_hover_color="#CCCCCC",
+        height=5,
+        border_width=1,
+        corner_radius=3,
+    )
+    enhancer_upscale_slider.place(relx=0.35, rely=0.855, relwidth=0.5, relheight=0.02)
+
     # Status and link at the bottom
     global status_label
     status_label = ctk.CTkLabel(root, text=None, justify="center")
@@ -577,8 +609,8 @@ def update_popup_source(
     global source_label_dict
 
     source_path = ctk.filedialog.askopenfilename(
+        initialdir=DEFAULT_SOURCE_DIRECTORY,
         title=_("select an source image"),
-        initialdir=RECENT_DIRECTORY_SOURCE,
         filetypes=[img_ft],
     )
 
@@ -672,8 +704,8 @@ def select_source_path() -> None:
 
     PREVIEW.withdraw()
     source_path = ctk.filedialog.askopenfilename(
+        initialdir=DEFAULT_SOURCE_DIRECTORY,
         title=_("select an source image"),
-        initialdir=RECENT_DIRECTORY_SOURCE,
         filetypes=[img_ft],
     )
     if is_image(source_path):
@@ -715,8 +747,8 @@ def select_target_path() -> None:
 
     PREVIEW.withdraw()
     target_path = ctk.filedialog.askopenfilename(
+        initialdir=DEFAULT_SOURCE_DIRECTORY,
         title=_("select an target image or video"),
-        initialdir=RECENT_DIRECTORY_TARGET,
         filetypes=[img_ft, vid_ft],
     )
     if is_image(target_path):
@@ -978,11 +1010,11 @@ def _capture_thread_func(cap, capture_queue, stop_event):
                 pass
 
 
-# Blind detect-every-N is too expensive and too unstable.
-# Use conditional re-detection based on cache validity, elapsed frames,
-# and simple scene-change scoring.
-REDETECT_INTERVAL = 12
-SCENE_CHANGE_THRESHOLD = 12.0
+# Live tracking policy:
+# - single-face mode: re-detect every frame for best yaw/tilt stability
+# - many-faces mode: keep conditional re-detection to control cost
+REDETECT_INTERVAL = 6
+SCENE_CHANGE_THRESHOLD = 8.0
 SCENE_SAMPLE_SIZE = (160, 90)
 
 
@@ -1007,12 +1039,15 @@ def _should_run_detection(
     cached_target_face,
     cached_many_faces,
 ) -> bool:
-    if modules.globals.many_faces:
-        if not cached_many_faces:
-            return True
-    else:
-        if cached_target_face is None:
-            return True
+    # In live single-face mode, stale cached landmarks/bboxes are exactly what
+    # causes mask slipping during head turns and tilt. Since runtime is already
+    # acceptable on this system, prefer correctness over cache reuse.
+    if not modules.globals.many_faces:
+        return True
+
+    # Multi-face mode is more expensive, so keep conditional refresh there.
+    if not cached_many_faces:
+        return True
 
     if last_detect_index < 0:
         return True
@@ -1199,73 +1234,83 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
 
 
 def create_webcam_preview(camera_index: int):
-    global preview_label, PREVIEW
+    global preview_label, PREVIEW, LIVE_PREVIEW_ACTIVE
 
-    cap = VideoCapturer(camera_index)
-    if not cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
-        update_status("Failed to start camera")
+    if LIVE_PREVIEW_ACTIVE:
+        update_status("Live preview is already running.")
+        try:
+            PREVIEW.deiconify()
+            PREVIEW.focus()
+        except Exception:
+            pass
         return
 
-    preview_label.configure(width=PREVIEW_DEFAULT_WIDTH, height=PREVIEW_DEFAULT_HEIGHT)
-    PREVIEW.deiconify()
-
-    # Queues for decoupling capture from processing and processing from display.
-    # Small maxsize ensures we always work on recent frames and drop stale ones.
+    LIVE_PREVIEW_ACTIVE = True
+    cap = VideoCapturer(camera_index)
     capture_queue = queue.Queue(maxsize=2)
     processed_queue = queue.Queue(maxsize=2)
     stop_event = threading.Event()
+    cap_thread = None
+    proc_thread = None
 
-    # Start capture thread
-    cap_thread = threading.Thread(
-        target=_capture_thread_func,
-        args=(cap, capture_queue, stop_event),
-        daemon=True,
-    )
-    cap_thread.start()
+    try:
+        if not cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
+            update_status("Failed to start camera")
+            return
 
-    # Start processing thread
-    proc_thread = threading.Thread(
-        target=_processing_thread_func,
-        args=(capture_queue, processed_queue, stop_event),
-        daemon=True,
-    )
-    proc_thread.start()
+        preview_label.configure(width=PREVIEW_DEFAULT_WIDTH, height=PREVIEW_DEFAULT_HEIGHT)
+        PREVIEW.deiconify()
 
-    # Main (UI) thread: pull processed frames and update the display
-    while not stop_event.is_set():
-        try:
-            temp_frame = processed_queue.get(timeout=0.03)
-        except queue.Empty:
-            ROOT.update()
-            continue
-
-        if modules.globals.live_resizable:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-        else:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-
-        image = gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(image)
-        image = ImageOps.contain(
-            image, (temp_frame.shape[1], temp_frame.shape[0]), Image.LANCZOS
+        cap_thread = threading.Thread(
+            target=_capture_thread_func,
+            args=(cap, capture_queue, stop_event),
+            daemon=True,
         )
-        image = ctk.CTkImage(image, size=image.size)
-        preview_label.configure(image=image)
-        ROOT.update()
+        cap_thread.start()
 
-        if PREVIEW.state() == "withdrawn":
-            break
+        proc_thread = threading.Thread(
+            target=_processing_thread_func,
+            args=(capture_queue, processed_queue, stop_event),
+            daemon=True,
+        )
+        proc_thread.start()
 
-    # Signal threads to stop and wait for them
-    stop_event.set()
-    cap_thread.join(timeout=2.0)
-    proc_thread.join(timeout=2.0)
-    cap.release()
-    PREVIEW.withdraw()
+        while not stop_event.is_set():
+            try:
+                temp_frame = processed_queue.get(timeout=0.03)
+            except queue.Empty:
+                ROOT.update()
+                if PREVIEW.state() == "withdrawn":
+                    break
+                continue
+
+            temp_frame = fit_image_to_size(
+                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
+            )
+
+            image = gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(image)
+            image = ImageOps.contain(
+                image, (temp_frame.shape[1], temp_frame.shape[0]), Image.LANCZOS
+            )
+            image = ctk.CTkImage(image, size=image.size)
+            preview_label.configure(image=image)
+            ROOT.update()
+
+            if PREVIEW.state() == "withdrawn":
+                break
+    finally:
+        stop_event.set()
+        if cap_thread is not None:
+            cap_thread.join(timeout=2.0)
+        if proc_thread is not None:
+            proc_thread.join(timeout=2.0)
+        cap.release()
+        try:
+            PREVIEW.withdraw()
+        except Exception:
+            pass
+        LIVE_PREVIEW_ACTIVE = False
 
 
 def create_source_target_popup_for_webcam(
@@ -1416,8 +1461,8 @@ def update_webcam_source(
     global source_label_dict_live
 
     source_path = ctk.filedialog.askopenfilename(
+        initialdir=DEFAULT_SOURCE_DIRECTORY,
         title=_("select an source image"),
-        initialdir=RECENT_DIRECTORY_SOURCE,
         filetypes=[img_ft],
     )
 
@@ -1468,8 +1513,8 @@ def update_webcam_target(
     global target_label_dict_live
 
     target_path = ctk.filedialog.askopenfilename(
+        initialdir=DEFAULT_SOURCE_DIRECTORY,
         title=_("select an target image"),
-        initialdir=RECENT_DIRECTORY_SOURCE,
         filetypes=[img_ft],
     )
 

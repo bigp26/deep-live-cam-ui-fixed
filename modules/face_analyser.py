@@ -34,7 +34,6 @@ def _runtime_execution_providers() -> list[str]:
     resolved = [
         provider
         for provider in (
-            "TensorrtExecutionProvider",
             "CUDAExecutionProvider",
             "CPUExecutionProvider",
         )
